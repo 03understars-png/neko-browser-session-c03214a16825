@@ -1,0 +1,218 @@
+name: Compute Base desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Longest the desktop may run, in minutes
+        default: "360"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compute-base-desktop
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: avrea-macos-26-8-vcpu
+    timeout-minutes: ${{ fromJSON(inputs.minutes || '360') }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Start the desktop
+        id: start
+        shell: bash
+        env:
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+          DESKTOP_LOGIN: ${{ secrets.DESKTOP_LOGIN }}
+          DESKTOP_VIEW_LOGIN: ${{ secrets.DESKTOP_VIEW_LOGIN }}
+          GATE_REPORT_URL: ${{ secrets.GATE_REPORT_URL }}
+          BRAVE_SYNC_CODE: ${{ secrets.BRAVE_SYNC_CODE }}
+          BOOKMARKS_URL: ${{ secrets.BOOKMARKS_URL }}
+          BURNER: ${{ secrets.BURNER }}
+          PROFILE_DOWNLOAD_URL: ${{ secrets.PROFILE_DOWNLOAD_URL }}
+          PROFILE_UPLOAD_URL: ${{ secrets.PROFILE_UPLOAD_URL }}
+          STOP_REQUEST_URL: ${{ secrets.STOP_REQUEST_URL }}
+          RELINK_URL: ${{ secrets.RELINK_URL }}
+          STATUS_KEY: ${{ secrets.STATUS_KEY }}
+          STATUS_UPLOAD_URL: ${{ secrets.STATUS_UPLOAD_URL }}
+          SYNC_REQUEST_URL: ${{ secrets.SYNC_REQUEST_URL }}
+          DEVICE_URL: ${{ secrets.DEVICE_URL }}
+          FILES_DOWNLOAD_URL: ${{ secrets.FILES_DOWNLOAD_URL }}
+          FILES_UPLOAD_URL: ${{ secrets.FILES_UPLOAD_URL }}
+          KIT_DOWNLOAD_URL: ${{ secrets.KIT_DOWNLOAD_URL }}
+          SCREEN: ${{ secrets.SCREEN }}
+          SOUND_CHECK: ${{ secrets.SOUND_CHECK }}
+          CB_HANDOFF_TEST: ${{ secrets.CB_HANDOFF_TEST }}
+          CB_LIMITLESS: ${{ secrets.CB_LIMITLESS }}
+          CB_SAFETY_SECONDS: ${{ secrets.CB_SAFETY_SECONDS }}
+          CB_IDLE_SECONDS: ${{ secrets.CB_IDLE_SECONDS }}
+          CB_OWN_SCREEN: ${{ secrets.CB_OWN_SCREEN }}
+        run: |
+          set -Eeuo pipefail
+          log_file="$RUNNER_TEMP/compute-base-desktop.log"
+          pid_file="$RUNNER_TEMP/compute-base-desktop.pid"
+
+          brew install --quiet bash >/dev/null 2>&1 || true
+          RUNNER_TRACKING_ID=compute-base-desktop nohup "$(brew --prefix)/bin/bash" ./scripts/run-desktop.sh >"$log_file" 2>&1 &
+          echo "$!" >"$pid_file"
+
+          shown=0
+          for _ in {1..450}; do
+            if [[ -f $log_file ]]; then
+              lines=$(wc -l <"$log_file")
+              if (( lines > shown )); then
+                sed -n "$((shown + 1)),${lines}p" "$log_file" | grep -v '^Browser is ready at' || true
+                shown=$lines
+              fi
+            fi
+            if ready_line=$(grep -m1 '^Browser is ready at https://' "$log_file" 2>/dev/null); then
+              public_url=${ready_line#Browser is ready at }
+              echo "url=$public_url" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+              sed -n "$((shown + 1)),\$p" "$log_file"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          sed -n "$((shown + 1)),\$p" "$log_file"
+          echo "The desktop did not publish a URL within fifteen minutes" >&2
+          exit 1
+
+      - name: Build status
+        shell: bash
+        env:
+          PUBLIC_URL: ${{ steps.start.outputs.url }}
+          STATUS_KEY: ${{ secrets.STATUS_KEY }}
+          DESKTOP_PASSWORD: ${{ secrets.DESKTOP_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          echo "::add-mask::$STATUS_KEY"
+          [[ ${#STATUS_KEY} -ge 32 ]] || { echo "Controller status key is invalid" >&2; exit 1; }
+          clean_value() {
+            tr '\r\n|' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+          }
+
+          cpu_model=$(sysctl -n machdep.cpu.brand_string | clean_value)
+          cpu_count=$(sysctl -n hw.ncpu)
+          memory=$(sysctl -n hw.memsize | awk '{printf "%.1f GiB", $1 / 1024 / 1024 / 1024}')
+          disk_free=$(df -h "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          macos=$(sw_vers -productVersion | clean_value)
+          browser_version=$("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --version 2>/dev/null | clean_value || true)
+          [[ -n "$browser_version" ]] || browser_version="Unavailable"
+          ready_utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          if [[ -f "$RUNNER_TEMP/compute-base-desktop/profile-restored" ]]; then
+            profile_state="Restored your saved Brave profile and files"
+          else
+            profile_state="Started with a fresh Mac desktop"
+          fi
+
+          ip_info=$(curl -sSL --max-time 4 https://ipapi.co/json 2>/dev/null || echo '{}')
+          ip_address=$(echo "$ip_info" | jq -r '.ip // "Unavailable"' | clean_value)
+          ip_location=$(echo "$ip_info" | jq -r 'if .city and .country_name then "\(.city), \(.region), \(.country_name)" else "Avrea datacenter" end' | clean_value)
+
+          clear_file="$RUNNER_TEMP/compute-base-status.json"
+          encrypted_file="$RUNNER_TEMP/compute-base-status.enc"
+          signature_file="$RUNNER_TEMP/compute-base-status.hmac"
+          machine=$(python3 scripts/desktop/measure.py "$RUNNER_TEMP" 2>/dev/null || true)
+          jq -e 'type == "object"' >/dev/null 2>&1 <<<"$machine" || machine=null
+          jq -n \
+            --argjson machine "$machine" \
+            --arg url "$PUBLIC_URL" \
+            --arg live_sync "$(grep '^\[live-sync\]' "$RUNNER_TEMP/compute-base-desktop.log" | tail -n 1 | sed 's/^\[live-sync\] //' || true)" \
+            --arg username "owner" \
+            --arg password "$DESKTOP_PASSWORD" \
+            --arg ready_at "$ready_utc" \
+            --arg runner "Avrea avrea-macos-26-8-vcpu" \
+            --arg kernel "macOS $macos" \
+            --arg cpu "$cpu_count CPUs; $cpu_model" \
+            --arg ram "$memory" \
+            --arg disk "$disk_free" \
+            --arg ip "$ip_address" \
+            --arg location "$ip_location" \
+            --arg browser "$browser_version" \
+            --arg desktop "macOS $macos with Brave" \
+            --arg display "$(cat "$RUNNER_TEMP/compute-base-desktop/display" 2>/dev/null || echo "Retina, 60 FPS (H.264)")" \
+            --arg profile "$profile_state" \
+            '{status:"ready", gate:true, system:"mac", url:$url, username:$username, password:$password, ready_at:$ready_at, runner:$runner, kernel:$kernel, cpu:$cpu, ram:$ram, disk:$disk, ip:$ip, location:$location, browser:$browser, desktop:$desktop, profile:$profile, display:$display, idle_shutdown:"15 minutes without a connected viewer", safety_cutoff:"One hour", live_sync:$live_sync, machine:$machine}' \
+            >"$clear_file"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+            -in "$clear_file" -out "$encrypted_file" -pass env:STATUS_KEY
+          openssl dgst -sha256 -hmac "$STATUS_KEY" -binary "$encrypted_file" \
+            | openssl base64 -A >"$signature_file"
+          rm -f "$clear_file"
+          echo "Ready."
+
+      - name: Upload status
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compute-base-status
+          path: |
+            ${{ runner.temp }}/compute-base-status.enc
+            ${{ runner.temp }}/compute-base-status.hmac
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Keep the browser available
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          pid=$(cat "$RUNNER_TEMP/compute-base-desktop.pid")
+          while kill -0 "$pid" 2>/dev/null; do
+            sleep 15
+          done
+          reason_file="$RUNNER_TEMP/compute-base-desktop/exit-reason"
+          if [[ -f "$reason_file" ]]; then
+            reason=$(<"$reason_file")
+            case "$reason" in
+              requested) echo "::notice title=Profile saved::The requested session stop completed." ;;
+              idle) echo "::notice title=Profile saved::No viewer was connected for 15 minutes." ;;
+              safety) echo "::notice title=Profile saved::The safety cutoff completed before the runner limit." ;;
+              signal) echo "::warning title=Profile saved::The runner received a termination signal." ;;
+              broken) echo "::warning title=Profile saved::The secure link stopped, so the desktop saved and stopped." ;;
+              *) echo "Unknown exit reason" >&2; exit 1 ;;
+            esac
+            [[ -f "$RUNNER_TEMP/compute-base-desktop/profile-saved" ]] || {
+              echo "The desktop exited without confirming a profile save" >&2
+              tail -n 80 "$RUNNER_TEMP/compute-base-desktop.log" >&2 || true
+              exit 1
+            }
+            exit 0
+          fi
+          echo "The desktop stopped unexpectedly" >&2
+          tail -n 80 "$RUNNER_TEMP/compute-base-desktop.log" >&2 || true
+          exit 1
+
+      - name: Clean up temporary processes
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [[ -f "$RUNNER_TEMP/compute-base-desktop.pid" ]]; then
+            kill "$(cat "$RUNNER_TEMP/compute-base-desktop.pid")" 2>/dev/null || true
+          fi
+          cat "$RUNNER_TEMP/compute-base-desktop/resize.log" 2>/dev/null || true
+          grep '^== ' "$RUNNER_TEMP/compute-base-desktop.log" 2>/dev/null || true
+          grep -E "viewer is connected|No desktop viewer|idle" "$RUNNER_TEMP/compute-base-desktop.log" 2>/dev/null | tail -n 20 || true
+
+      - name: Self-destruct temporary repository
+        if: ${{ !failure() }}
+        shell: bash
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+          SOUND_CHECK: ${{ secrets.SOUND_CHECK }}
+        run: |
+          if [[ -n "${RUNNER_PAT:-}" && "${SOUND_CHECK:-}" != 1 ]]; then
+            echo "Deleting temporary runtime repository..."
+            curl -s -X DELETE \
+              -H "Authorization: Bearer $RUNNER_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/${{ github.repository }}" >/dev/null 2>&1 || true
+          fi
